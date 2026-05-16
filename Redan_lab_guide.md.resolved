@@ -440,3 +440,5 @@ ip a
 □ Server thấy IP 1.1.1.1 (không phải 192.168.1.10)
 □ conntrack trên OpenWrt có entry khi client kết nối
 ```
+
+watch -n1 'cat /proc/net/nf_conntrack | grep 8080'
