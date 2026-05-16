@@ -1,0 +1,113 @@
+# Tóm tắt bài báo: ReDAN
+## *"An Empirical Study on Remote DoS Attacks against NAT Networks"*
+> **NDSS 2025** | Xuewei Feng et al.
+
+---
+
+## 🎯 Tổng quan
+
+**ReDAN** là một nghiên cứu thực nghiệm vạch trần lỗ hổng bảo mật nghiêm trọng trong cách các thiết bị **NAT (Network Address Translation)** xử lý giao thức. Bài báo chứng minh một kẻ tấn công **Off-path** (không nằm trên đường truyền vật lý giữa nạn nhân và máy chủ) có thể thực hiện tấn công **DoS từ xa** để ngắt kết nối TCP của các thiết bị đang nằm sau NAT.
+
+| Thuộc tính | Chi tiết |
+|---|---|
+| **Loại tấn công** | Remote DoS (Off-path) |
+| **Mục tiêu** | Kết nối TCP qua NAT |
+| **Băng thông yêu cầu** | ~5.72 MB/s *(rất thấp, không cần Botnet)* |
+| **Công bố** | NDSS 2025 |
+
+---
+
+## ⛓️ Chuỗi lỗ hổng (Vulnerability Chain)
+
+Tấn công ReDAN hoạt động theo hai giai đoạn nối tiếp:
+
+```
+[Kẻ tấn công Off-path]
+        │
+        ├─── Giai đoạn 1: PMTUD Poisoning ──► Xác định NAT Port
+        │
+        └─── Giai đoạn 2: NAT Mapping Teardown ──► Ngắt kết nối TCP
+```
+
+---
+
+## 📌 Giai đoạn 1: Xuyên thủng & Nhận diện (PMTUD Side-Channel)
+
+**Mục tiêu:** Xác định NAT Port đang được sử dụng mà không cần sniff trực tiếp.
+
+### Bước 1 — Đầu độc bằng ICMP
+- Gửi gói tin **ICMP giả mạo** loại `Type 3 Code 4` (*Fragmentation Needed*)
+- "Nói dối" rằng đường truyền đang bị hẹp lại → ép hai bên hạ **Path MTU** xuống thấp (thường ≈ 576 bytes)
+
+### Bước 2 — Khai thác Side-channel
+- Nhiều hệ thống quản lý thông tin PMTUD theo **per-IP** thay vì per-connection → **rò rỉ thông tin**
+- Kẻ tấn công theo dõi sự thay đổi kích thước gói tin / độ trễ bất thường
+- Từ đó **xác định chính xác NAT Port** đang mở cho kết nối mục tiêu
+
+> [!NOTE]
+> Đây là điểm cốt lõi: vì PMTUD không cô lập theo từng kết nối, thông tin về Port bị rò rỉ ra ngoài dù kẻ tấn công không có vị trí ưu thế trên mạng.
+
+---
+
+## 📌 Giai đoạn 2: Xóa sổ bản ghi NAT (NAT Mapping Teardown)
+
+**Mục tiêu:** Phá hủy bộ nhớ của thiết bị NAT để ngắt kết nối TCP.
+
+### Bước 1 — Bắn phá TCP giả mạo
+- Chế tạo hàng loạt gói tin TCP giả mạo (cờ **RST** hoặc **RST/ACK**)
+- Địa chỉ IP nguồn **đóng giả là máy chủ đích** (Server)
+- Xả về phía thiết bị NAT
+
+### Bước 2 — Khai thác kiểm tra lỏng lẻo
+- Theo **RFC 5961**, RST chỉ hợp lệ nếu Sequence Number khớp chính xác cửa sổ nhận
+- Thực tế: **phần lớn thiết bị NAT bỏ qua kiểm tra SEQ** để tiết kiệm CPU
+- Chỉ cần khớp IP + Port → NAT chấp nhận gói RST giả mạo
+
+### Bước 3 — Xóa bộ nhớ
+- NAT bị lừa → cho rằng phiên đã kết thúc hợp lệ
+- Xóa bản ghi ánh xạ (NAT mapping) khỏi bảng **`nf_conntrack`**
+
+> [!CAUTION]
+> Đây là lỗ hổng cơ bản: thiết bị NAT ưu tiên hiệu năng CPU hơn tính chính xác của kiểm tra, tạo ra bề mặt tấn công không ngờ tới.
+
+---
+
+## 💥 Kết quả: DoS hoàn toàn
+
+```
+Client gửi gói tin mới
+        │
+        ▼
+NAT không còn bản ghi cũ
+        │
+        ├── Drop gói tin, HOẶC
+        └── Tạo NAT mapping MỚI với port ngẫu nhiên
+                │
+                ▼
+        Server từ chối → gửi RST thật về Client
+                │
+                ▼
+        ❌ "Connection Reset by Peer" — Ứng dụng nạn nhân bị văng lỗi
+```
+
+---
+
+## 🔑 Điểm mấu chốt
+
+| # | Insight |
+|---|---|
+| **1** | Tấn công Off-path **không cần Botnet hay DDoS** quy mô lớn |
+| **2** | Chỉ cần ~5.72 MB/s để "rải thảm" toàn bộ dải port ephemeral |
+| **3** | PMTUD side-channel làm lộ thông tin port dù kẻ tấn công "mù" |
+| **4** | NAT bỏ qua RFC 5961 vì lý do hiệu năng → cửa hậu cho RST giả |
+| **5** | Ảnh hưởng toàn diện: mọi kết nối TCP qua NAT đều có nguy cơ |
+
+---
+
+## 🛡️ Hướng phòng thủ (implied)
+
+- **PMTUD:** Cô lập thông tin MTU theo từng kết nối (per-connection) thay vì per-IP
+- **RST Validation:** Áp dụng nghiêm RFC 5961 — kiểm tra Sequence Number chặt chẽ
+- **ICMP Rate Limiting:** Giới hạn tốc độ xử lý gói ICMP từ các nguồn không xác định
+- **Stateful Inspection:** Tăng cường kiểm tra trạng thái kết nối trong bảng `nf_conntrack`
+
