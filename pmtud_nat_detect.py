@@ -6,19 +6,27 @@
 import time
 from scapy.all import IP, ICMP, TCP, send, sr1, conf
 
-# Cấu hình IP
-TARGET_IP = "1.1.1.1"      # Địa chỉ IP công cộng cần kiểm tra (OpenWRT)
-SERVER_IP = "1.1.1.10"     # Điểm quan sát (Vantage Point) - Giả lập
-TARGET_PORT = 40000        # Một port đang giao tiếp
-SERVER_PORT = 8080
+# Không dùng IP cứng nữa, ta sẽ cho người dùng nhập vào
 
 def detect_nat():
     print("="*60)
     print("🔎 BƯỚC 0: PHÁT HIỆN THIẾT BỊ NAT BẰNG LỖ HỔNG PMTUD")
     print("="*60)
     
+    # Yêu cầu nhập thông số
+    TARGET_IP = input("Nhập IP mục tiêu cần kiểm tra (Mặc định: 1.1.1.1): ") or "1.1.1.1"
+    SERVER_IP = input("Nhập IP máy chủ quan sát (Mặc định: 1.1.1.10): ") or "1.1.1.10"
+    try:
+        TARGET_PORT = int(input("Nhập Port mục tiêu (Mặc định: 40000): ") or "40000")
+        SERVER_PORT = int(input("Nhập Port máy chủ (Mặc định: 8080): ") or "8080")
+    except ValueError:
+        print("[!] Lỗi: Port phải là số nguyên.")
+        return
+
+    print(f"\n[+] Đang thám thính mục tiêu {TARGET_IP} (Giao tiếp với Server {SERVER_IP}:{SERVER_PORT})")
+    
     # 1. GỬI GÓI ICMP FRAGMENTATION NEEDED (Thay đổi PMTU của Client)
-    print(f"[*] BƯỚC 1: Đóng giả Router trung gian, ép mục tiêu giảm MTU xuống 500 bytes.")
+    print(f"\n[*] BƯỚC 1: Đóng giả Router trung gian, ép mục tiêu giảm MTU xuống 500 bytes.")
     
     # Gói TCP gốc mà mục tiêu đã gửi (cần để gắn vào payload của ICMP Error)
     # Trong thực tế, Attacker sẽ copy header của gói tin bắt được.
