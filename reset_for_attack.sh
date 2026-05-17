@@ -71,18 +71,36 @@ reset_attacker() {
     echo "=== ATTACKER READY ==="
 }
 
+secure_openwrt() {
+    echo "=== BẬT CHẾ ĐỘ PHÒNG THỦ (OPENWRT SECURE MODE) ==="
+    # 1. Bật Strict Reverse Path Forwarding (Chống Spoofing)
+    echo 1 > /proc/sys/net/ipv4/conf/all/rp_filter
+    echo 1 > /proc/sys/net/ipv4/conf/eth0/rp_filter
+    echo 1 > /proc/sys/net/ipv4/conf/eth1/rp_filter 2>/dev/null
+    
+    # 2. Khôi phục TCP CLOSE timeout về mức an toàn mặc định (10 giây)
+    sysctl -w net.netfilter.nf_conntrack_tcp_timeout_close=10 2>/dev/null || echo 10 > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_close
+    
+    # 3. Verify
+    echo "[+] Chống Spoofing (rp_filter) = $(cat /proc/sys/net/ipv4/conf/all/rp_filter) [BẬT]"
+    echo "[+] TCP CLOSE timeout = $(cat /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_close 2>/dev/null) giây"
+    echo "=== HỆ THỐNG ĐÃ ĐƯỢC BẢO VỆ ==="
+}
+
 case $NODE in
-    server)   reset_server ;;
-    backbone) reset_backbone ;;
-    openwrt)  reset_openwrt ;;
-    attacker) reset_attacker ;;
+    server)         reset_server ;;
+    backbone)       reset_backbone ;;
+    openwrt)        reset_openwrt ;;
+    secure_openwrt) secure_openwrt ;;
+    attacker)       reset_attacker ;;
     *)
-        echo "Usage: bash reset_for_attack.sh [server|backbone|openwrt|attacker]"
+        echo "Usage: bash reset_for_attack.sh [server|backbone|openwrt|secure_openwrt|attacker]"
         echo ""
         echo "Chạy trên từng node:"
         echo "  Server:   sudo bash reset_for_attack.sh server"
         echo "  Backbone: bash reset_for_attack.sh backbone"
         echo "  OpenWrt:  bash reset_for_attack.sh openwrt"
+        echo "  Secure:   bash reset_for_attack.sh secure_openwrt"
         echo "  Attacker: sudo bash reset_for_attack.sh attacker"
         ;;
 esac

