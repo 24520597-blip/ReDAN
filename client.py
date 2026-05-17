@@ -30,9 +30,17 @@ def connection_worker(conn_id: int):
             print(f"[+] S{conn_id} connected  local_port={local_port}  attempt={attempt}")
             attempt = 0  # reset sau khi kết nối thành công
 
+            s.settimeout(10) # Báo lỗi nếu 10s không nhận được phản hồi
             while True:
                 msg = f"HEARTBEAT-S{conn_id}".encode()
                 s.sendall(msg)
+                
+                # Chờ nhận phản hồi từ Server
+                data = s.recv(1024)
+                if not data:
+                    print(f"[-] S{conn_id} closed by server")
+                    break
+                    
                 time.sleep(HEARTBEAT_S)
 
         except ConnectionRefusedError:

