@@ -7,6 +7,7 @@ Chạy: python3 server.py
 import socket
 import threading
 import time
+from collections import defaultdict
 
 SERVER_IP   = "1.1.1.10"
 SERVER_PORT = 8080
@@ -14,8 +15,19 @@ SERVER_PORT = 8080
 active_connections = {}   # { (ip, port): socket }
 lock = threading.Lock()
 
+# 🛡️ TẦNG 4: APPLICATION DEFENSE (Theo dõi hành vi đứt kết nối)
+disconnect_tracker = defaultdict(list)
+
+def trigger_alert(client_ip):
+    print("\n" + "!"*60)
+    print(f" [CRITICAL ALERT] PHÁT HIỆN TẤN CÔNG DoS / RST INJECTION!")
+    print(f" Mục tiêu IP bị tấn công: {client_ip}")
+    print(f" Hành vi: Đứt kết nối (RST) liên tục bất thường.")
+    print("!"*60 + "\n")
+
 # ─────────────────────────────────────────
 def handle_client(conn, addr):
+    client_ip = addr[0]
     with lock:
         active_connections[addr] = conn
         print(f"[+] Connected   : {addr[0]}:{addr[1]}  |  total={len(active_connections)}")
@@ -31,6 +43,18 @@ def handle_client(conn, addr):
         print(f"[!] Timeout      : {addr}")
     except ConnectionResetError:
         print(f"[!] RST received : {addr}  ← socket torn down by attack")
+        # --- THỰC THI LỚP PHÒNG THỦ SỐ 4 ---
+        with lock:
+            now = time.time()
+            # Giữ lại các lần đứt kết nối trong 10 giây qua
+            disconnect_tracker[client_ip] = [t for t in disconnect_tracker[client_ip] if now - t < 10]
+            disconnect_tracker[client_ip].append(now)
+            
+            # Cảnh báo nếu > 3 lần trong 10 giây
+            if len(disconnect_tracker[client_ip]) > 3:
+                trigger_alert(client_ip)
+                # Reset bộ đếm để không spam log
+                disconnect_tracker[client_ip] = []
     except Exception as e:
         print(f"[!] Error        : {addr} — {e}")
     finally:
