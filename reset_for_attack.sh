@@ -23,6 +23,21 @@ reset_server() {
     echo "=== SERVER READY ==="
 }
 
+secure_server() {
+    echo "=== BẬT PHÒNG THỦ LỚP 1: KERNEL HARDENING (SERVER) ==="
+    # 1. Vá gốc lỗ hổng Side-channel (Nâng max challenge ACK)
+    sysctl -w net.ipv4.tcp_challenge_ack_limit=2147483647
+    
+    # 2. Chống RST injection vào trạng thái TIME-WAIT
+    sysctl -w net.ipv4.tcp_rfc1337=1
+    
+    # 3. Bật SYN cookies chống SYN flood
+    sysctl -w net.ipv4.tcp_syncookies=1
+    
+    echo "[+] Đã vá lỗi CVE-2016-5696 và thiết lập Kernel an toàn!"
+    echo "=== SERVER SECURED ==="
+}
+
 reset_backbone() {
     echo "=== RESET BACKBONE ==="
     # 1. Tắt rp_filter trên tất cả interfaces
@@ -72,35 +87,53 @@ reset_attacker() {
 }
 
 secure_openwrt() {
-    echo "=== BẬT CHẾ ĐỘ PHÒNG THỦ (OPENWRT SECURE MODE) ==="
-    # 1. Bật Strict Reverse Path Forwarding (Chống Spoofing)
+    echo "=== BẬT PHÒNG THỦ LỚP 2 & 3: NAT & EDGE HARDENING (OPENWRT) ==="
+    
+    # ---------------- LỚP 3: NETWORK EDGE ----------------
+    # 1. Bật Strict Reverse Path Forwarding (Chống Spoofed IP)
     echo 1 > /proc/sys/net/ipv4/conf/all/rp_filter
     echo 1 > /proc/sys/net/ipv4/conf/eth0/rp_filter
     echo 1 > /proc/sys/net/ipv4/conf/eth1/rp_filter 2>/dev/null
     
-    # 2. Khôi phục TCP CLOSE timeout về mức an toàn mặc định (10 giây)
+    # 2. Rate limit RST packets từ bên ngoài vào (Chống thả thảm RST)
+    iptables -A INPUT -p tcp --tcp-flags RST RST -m limit --limit 5/s --limit-burst 10 -j ACCEPT
+    iptables -A INPUT -p tcp --tcp-flags RST RST -j DROP
+    
+    # ---------------- LỚP 2: NAT DEVICE ----------------
+    # 3. Strict conntrack - Không dễ dãi với các gói RST lọt lưới
+    sysctl -w net.netfilter.nf_conntrack_tcp_loose=0 2>/dev/null || true
+    
+    # 4. Trả TCP CLOSE timeout về mặc định (10 giây)
     sysctl -w net.netfilter.nf_conntrack_tcp_timeout_close=10 2>/dev/null || echo 10 > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_close
     
-    # 3. Verify
+    # 5. Randomize port mapping chống đoán Port
+    iptables -t nat -A POSTROUTING -j MASQUERADE --random-fully 2>/dev/null || true
+    
+    # 6. Rate limit SYN-ACK (Chống dò quét Port bằng Side-channel)
+    iptables -A INPUT -p tcp --tcp-flags SYN,ACK SYN,ACK -m limit --limit 10/s --limit-burst 20 -j ACCEPT
+    iptables -A INPUT -p tcp --tcp-flags SYN,ACK SYN,ACK -j DROP
+    
     echo "[+] Chống Spoofing (rp_filter) = $(cat /proc/sys/net/ipv4/conf/all/rp_filter) [BẬT]"
-    echo "[+] TCP CLOSE timeout = $(cat /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_close 2>/dev/null) giây"
-    echo "=== HỆ THỐNG ĐÃ ĐƯỢC BẢO VỆ ==="
+    echo "[+] Đã kích hoạt Rate Limit (RST & SYN-ACK) và Random NAT!"
+    echo "=== OPENWRT SECURED ==="
 }
 
 case $NODE in
     server)         reset_server ;;
+    secure_server)  secure_server ;;
     backbone)       reset_backbone ;;
     openwrt)        reset_openwrt ;;
     secure_openwrt) secure_openwrt ;;
     attacker)       reset_attacker ;;
     *)
-        echo "Usage: bash reset_for_attack.sh [server|backbone|openwrt|secure_openwrt|attacker]"
+        echo "Usage: bash reset_for_attack.sh [server|secure_server|backbone|openwrt|secure_openwrt|attacker]"
         echo ""
         echo "Chạy trên từng node:"
-        echo "  Server:   sudo bash reset_for_attack.sh server"
-        echo "  Backbone: bash reset_for_attack.sh backbone"
-        echo "  OpenWrt:  bash reset_for_attack.sh openwrt"
-        echo "  Secure:   bash reset_for_attack.sh secure_openwrt"
-        echo "  Attacker: sudo bash reset_for_attack.sh attacker"
+        echo "  [Tạo lỗi] Server:  sudo bash reset_for_attack.sh server"
+        echo "  [Bảo vệ]  Server:  sudo bash reset_for_attack.sh secure_server"
+        echo "  [Tạo lỗi] OpenWrt: bash reset_for_attack.sh openwrt"
+        echo "  [Bảo vệ]  OpenWrt: bash reset_for_attack.sh secure_openwrt"
+        echo "  [Cơ sở]   Backbone:bash reset_for_attack.sh backbone"
+        echo "  [Tấn công]Attacker:sudo bash reset_for_attack.sh attacker"
         ;;
 esac
