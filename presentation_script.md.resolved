@@ -1,0 +1,105 @@
+# Kịch bản Thuyết trình Bảo vệ Đồ án: Phân tích & Phòng thủ Tấn công ReDAN
+
+Kịch bản này được thiết kế theo hướng **Storytelling (Kể chuyện)** để lôi cuốn Hội đồng. Bạn hãy thuyết trình với phong thái tự tin, tương tác bằng mắt với các thầy cô và chú ý nhịp điệu (ngừng nghỉ khoảng 1-2 giây khi chuyển slide).
+
+---
+
+## PHẦN 1: TỔNG QUAN & MÔ HÌNH MẠNG
+
+**[Chiếu slide "Sơ đồ mạng"]**
+
+**Bạn:** "Kính thưa Hội đồng, đề tài của nhóm chúng em tập trung vào việc nghiên cứu và phòng thủ một kỹ thuật tấn công vô cùng tinh vi mang tên ReDAN. 
+Để các thầy cô dễ hình dung, em xin phép giới thiệu sơ đồ mạng của bài Lab. Mô hình gồm có 1 máy Client nạn nhân nằm an toàn phía sau một Router NAT (OpenWRT). Ở đầu bên kia là máy chủ Server. Và đặc biệt, Kẻ tấn công (Attacker) nằm ở một nhánh mạng hoàn toàn riêng biệt (Off-path), ngăn cách bởi Backbone Router. Kẻ tấn công không hề đứng giữa đường truyền, không thể nghe lén bất kỳ gói tin nào giữa Client và Server."
+
+**[Chiếu slide "Threat Model" & "Tổng quan"]**
+
+**Bạn:** "Với mô hình này (Threat Model), Kẻ tấn công dường như bị 'mù' hoàn toàn. Tuy nhiên, mục tiêu của kẻ tấn công là: *Làm sao để phát hiện ra Client đang núp sau NAT, và làm sao để bóp nghẹt, ngắt vĩnh viễn kết nối của Client đó tới Server?*
+Để làm được điều này, Kẻ tấn công sẽ khai thác hàng loạt các lỗ hổng logic đan xen nhau giữa thiết bị NAT và máy chủ Linux."
+
+---
+
+## PHẦN 2: CƠ SỞ LÝ THUYẾT (NAT & PMTUD)
+
+**[Chiếu slide "Network Address Translation (NAT)"]**
+
+**Bạn:** "Đầu tiên, nhắc lại một chút về NAT. NAT giống như 'bác bảo vệ' của mạng nội bộ, giúp ẩn giấu toàn bộ địa chỉ IP của Client và thay thế bằng một IP Public duy nhất để đi ra ngoài Internet."
+
+**[Chiếu slide "Session Mapping Table"]**
+
+**Bạn:** "Để quản lý, NAT dùng một **Bảng ánh xạ (Session Mapping Table)**. Khi có kết nối TCP mới, nó ghi nhận trạng thái `ESTABLISHED` và duy trì tới tận 5 ngày. NHƯNG, điểm tử huyệt nằm ở dòng cuối cùng: Khi nhận được gói tin Reset (RST), thiết bị NAT sẽ lập tức đưa trạng thái về `CLOSE` và **xóa bản ghi này khỏi bộ nhớ chỉ sau đúng 1 giây**. Sự vội vã 1 giây này chính là gót chân Achilles mà chúng em sẽ khai thác."
+
+**[Chiếu slide "Path MTU Discovery (PMTUD)"]**
+
+**Bạn:** "Cơ sở thứ hai là cơ chế PMTUD. Khi một thiết bị gửi gói tin có cờ `DF=1` (Don't Fragment) nhưng gói tin lại quá to so với đường truyền, Router sẽ từ chối và gửi trả lại một tin nhắn báo lỗi `ICMP Fragmentation Needed`. Tin nhắn báo lỗi này vô tình trở thành một 'kênh rò rỉ thông tin' tuyệt vời cho Kẻ tấn công."
+
+---
+
+## PHẦN 3: THỰC THI TẤN CÔNG (EXPLOITATION)
+
+**[Chiếu slide "Bước 1: Xác định thiết bị NAT" & "Thay đổi MTU của Client"]**
+
+**Bạn:** "Bước vào Giai đoạn 1 của cuộc tấn công: Kẻ tấn công gửi các gói tin ICMP giả mạo báo lỗi MTU đến Router NAT. Vì NAT không kiểm tra kỹ lưỡng, nó lầm tưởng đường truyền bị nghẽn và ép Client phải giảm kích thước gói tin (MSS). 
+Bằng việc quan sát sự thay đổi kích thước của các gói tin dội về, Kẻ tấn công 'đoán' được chính xác: *À, có một thiết bị NAT ở đó, và nó đang mở Port ảo (Ephemeral Port) số X cho nạn nhân.*"
+
+🎬 **[DEMO CUE: Tại Terminal Attacker, chạy lệnh `python3 pmtud_nat_detect.py`]**
+
+**[Chiếu slide "Bước 2: Tiến hành tấn công DoS" & "Xóa ánh xạ NAT"]**
+
+**Bạn:** "Khi đã biết Port X, cuộc thảm sát bắt đầu. 
+Ở Stage 1 (Xóa ánh xạ NAT), Kẻ tấn công nã 30.000 gói `RST` với Sequence Number quét dọc không gian TCP vào NAT. Vì đặc tính 'Loose Tracking' (dễ dãi) của thiết bị NAT phần cứng, NAT lập tức tin rằng kết nối đã kết thúc và vội vã **xóa luôn bản ghi trong cuốn sổ Mapping**."
+
+🎬 **[DEMO CUE: Tại Terminal Attacker, chạy lệnh `python3 attacker.py` (Nó sẽ tự chạy Stage 2 quét 30.000 gói)]**
+
+**[Chiếu slide "Thao túng trạng thái TCP"]**
+
+**Bạn:** "Thế nhưng, Server Linux thì khắt khe hơn. Gói RST ngẫu nhiên sẽ bị Server vứt sọt rác. Đoán đúng Sequence Number trong 4 Tỷ con số là mò kim đáy biển.
+Lúc này, Kẻ tấn công dùng chiêu trò 'Thao túng trạng thái TCP' (Stage 2). Thay vì đoán mò, Kẻ tấn công ném một cục đá dò đường bằng gói **PUSH/ACK** sai luật. Server 'tốt bụng' thấy gói sai luật liền đáp trả bằng một gói **DUP ACK**. Tuyệt vời thay, gói DUP ACK này lại chứa tham số `rcv.nxt` - chính là tọa độ Sequence Number hiện tại! Server đã tự khai ra huyệt đạo của mình."
+
+**[Chiếu slide "Chấm dứt các kết nối TCP"]**
+
+**Bạn:** "Có Port, có tọa độ Sequence chính xác. Kẻ tấn công chuyển sang Stage 3. Một gói RST chí mạng được ráp lại và gửi thẳng đến Server. Kết nối ngay lập tức bị chặt đứt.
+Tuy nhiên, nếu Client tiếp tục gửi dữ liệu, NAT sẽ tự động khôi phục (Resurrect) kết nối. Để triệt hạ hoàn toàn, Kẻ tấn công tiến hành chiến thuật **Carpet Bombing (Rải thảm)**: Bắn liên thanh hàng ngàn gói RST để đè bẹp kết nối. Nạn nhân bị cắt mạng Internet hoàn toàn mà không hiểu lý do vì sao."
+
+🎬 **[DEMO CUE: Chỉ vào màn hình Client (chạy `client.py`) đang bị đứt kết nối (Flapping/Timeout)]**
+
+---
+
+## PHẦN 4: GIẢI PHÁP PHÒNG THỦ ĐA LỚP (DEFENSE IN DEPTH)
+
+**[Chiếu slide "Defense In Depth"]**
+
+**Bạn:** "Nhận thức được mức độ tàn phá tinh vi của ReDAN, khi mà Kẻ tấn công lợi dụng những lỗ hổng trải dài từ Router cho tới hệ điều hành, nhóm em đã thiết kế một hệ thống phòng thủ **Đa lớp (Defense In Depth)** gồm 3 chốt chặn vững chắc:
+
+- **Lớp 1 - Edge Network Filtering (Bộ lọc biên):** Đây là tuyến phòng thủ đầu tiên đặt tại Backbone Router. Cơ chế cốt lõi ở đây là **Strict uRPF (Chống giả mạo IP)**. Nó giống như một trạm kiểm lâm: Khi một gói tin đi từ Internet vào nhưng lại mang Source IP của mạng nội bộ (như kẻ tấn công giả mạo IP của OpenWRT), Router sẽ lập tức tiêu diệt gói tin đó từ trong trứng nước. Kẻ tấn công bị tước vũ khí ngay tại cửa ngõ."
+
+🎬 **[DEMO CUE: Tại Terminal, chạy lệnh `./reset_for_attack.sh` và chọn `secure_backbone`]**
+
+**Bạn:** "- **Lớp 2 - NAT & Connection Hardening (Làm cứng NAT):** Nếu vì lý do nào đó gói tin lọt qua được Lớp 1, Lớp 2 tại OpenWRT sẽ đảm nhận. Tại đây, chúng em áp dụng **Strict Conntrack Validation** (buộc NAT phải kiểm tra khắt khe trạng thái TCP thay vì 'dễ dãi' Loose Tracking) và **Randomized NAT Port Mapping** (ngẫu nhiên hóa cổng). Điều này khiến NAT trở nên 'khó đoán', làm mù hoàn toàn nỗ lực dò quét Side-channel của kẻ tấn công."
+
+🎬 **[DEMO CUE: Tại Terminal, chạy lệnh `./reset_for_attack.sh` và chọn `secure_openwrt`]**
+
+**Bạn:** "- **Lớp 3 - Kernel TCP Hardening (Làm cứng máy chủ):** Chốt chặn cuối cùng nằm tại Server. Chúng em thiết lập cấu hình **Challenge ACK Hardening** để chặn tận gốc việc Server làm 'kẻ chỉ điểm' (Oracle) rò rỉ thông tin Sequence Number cho Kẻ tấn công.
+
+**Tổng kết:** Với 3 lớp khiên liên hoàn này, cuộc tấn công ReDAN bị bẻ gãy hoàn toàn mà vẫn đảm bảo luồng dữ liệu hợp lệ của người dùng (User) diễn ra xuyên suốt, không hề bị tăng độ trễ (Zero-Impact)."
+
+---
+
+## PHẦN 5: CÂU HỎI THƯỜNG GẶP (Q&A) & CÁCH TRẢ LỜI "10 ĐIỂM"
+
+Đây là các câu hỏi Hội đồng (GV Phản biện) rất hay hỏi xoáy, bạn hãy học kỹ để tự tin đỡ đạn nhé:
+
+### 1. "Tại sao em không dùng Man-in-the-Middle (MITM) cho dễ mà phải làm mô hình Off-path lằng nhằng này?"
+**💡 Cách trả lời:** 
+"Dạ thưa thầy, MITM yêu cầu Kẻ tấn công phải **nằm cùng mạng LAN** (cắm cùng Switch hoặc chung WiFi) với nạn nhân. Điều này phi thực tế nếu muốn tấn công một doanh nghiệp từ xa. Mô hình Off-path (Blind Attack) của chúng em nguy hiểm ở chỗ: Kẻ tấn công **ngồi ở quốc gia khác** vẫn ngắt được mạng của nạn nhân. Kẻ tấn công hoàn toàn bị mù, không đọc được gói tin, nhưng dùng tư duy logic để 'hack' cơ chế của TCP."
+
+### 2. "Tại sao Kẻ tấn công bắt buộc phải giả mạo IP (Spoofing) của OpenWRT NAT?"
+**💡 Cách trả lời:** 
+"Dạ, vì nguyên tắc của TCP là xác thực danh tính qua [Source IP + Port]. Kẻ tấn công muốn lừa Server đóng kết nối của nạn nhân, thì Kẻ tấn công phải **nhập vai** làm nạn nhân. Do nạn nhân bị ẩn sau IP Public của Router NAT (1.1.1.1), nên Kẻ tấn công bắt buộc phải làm giả Source IP thành 1.1.1.1. Đó là lý do tại sao tính năng `rp_filter` (Chống giả mạo IP) lại là liều thuốc giải hiệu quả nhất cho cuộc tấn công này ạ."
+
+### 3. "Việc em giảm tcp_challenge_ack_limit ở Server xuống còn 5 để dễ demo. Vậy ở môi trường thực tế (limit = 1000) thì có tấn công được không?"
+**💡 Cách trả lời:** 
+"Dạ hoàn toàn được ạ. Limit 1000 là giới hạn mặc định của các nhân Linux cũ. Nếu limit là 1000, Kẻ tấn công chỉ việc dùng công cụ đẩy tốc độ gửi (Packet Rate) cao hơn để ngốn hết 1000 Challenge ACK trong 1 giây. Việc em hạ xuống 5 trong bài Lab chỉ để tiết kiệm CPU cho máy ảo, giúp Demo mượt mà hơn, chứ không hề làm thay đổi bản chất vật lý của lỗ hổng."
+
+### 4. "Lớp phòng thủ của em có làm chậm mạng không?"
+**💡 Cách trả lời:** 
+"Dạ, thiết kế Defense-in-Depth của nhóm em là **Zero-Impact (Không ảnh hưởng)** đến người dùng. Tường lửa `rp_filter` hay Random NAT hoạt động ở cấp độ Kernel/Phần cứng, chi phí xử lý chỉ là O(1). Giao thông mạng hợp lệ vẫn chảy qua mượt mà, chỉ có rác (packet giả mạo) là bị chặn lại. Em đã cấu hình thực tế và ping test không bị tăng độ trễ (latency) một mili-giây nào ạ."
