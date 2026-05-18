@@ -57,6 +57,17 @@ reset_backbone() {
     echo "=== BACKBONE READY ==="
 }
 
+secure_backbone() {
+    echo "EDGE NETWORK FILTERING (BACKBONE) ==="
+    # Bật Strict Reverse Path Forwarding (Chống Spoofed IP)
+    echo 1 > /proc/sys/net/ipv4/conf/all/rp_filter
+    echo 1 > /proc/sys/net/ipv4/conf/default/rp_filter
+    echo 1 > /proc/sys/net/ipv4/conf/eth0/rp_filter
+    echo 1 > /proc/sys/net/ipv4/conf/eth1/rp_filter 2>/dev/null || true
+    echo "[+] Chống Spoofing (rp_filter) = $(cat /proc/sys/net/ipv4/conf/all/rp_filter) [BẬT]"
+    echo "=== BACKBONE SECURED ==="
+}
+
 reset_openwrt() {
     echo "=== RESET OPENWRT NAT ==="
     # 1. rp_filter off
@@ -87,9 +98,8 @@ reset_attacker() {
 }
 
 secure_openwrt() {
-    echo "=== BẬT PHÒNG THỦ LỚP 2 & 3: NAT & EDGE HARDENING (OPENWRT) ==="
+    echo "=== NAT & EDGE HARDENING (OPENWRT) ==="
     
-    # ---------------- LỚP 3: NETWORK EDGE ----------------
     # 1. Bật Strict Reverse Path Forwarding (Chống Spoofed IP)
     echo 1 > /proc/sys/net/ipv4/conf/all/rp_filter
     echo 1 > /proc/sys/net/ipv4/conf/eth0/rp_filter
@@ -99,7 +109,6 @@ secure_openwrt() {
     iptables -A INPUT -p tcp --tcp-flags RST RST -m limit --limit 5/s --limit-burst 10 -j ACCEPT
     iptables -A INPUT -p tcp --tcp-flags RST RST -j DROP
     
-    # ---------------- LỚP 2: NAT DEVICE ----------------
     # 3. Strict conntrack - Không dễ dãi với các gói RST lọt lưới
     sysctl -w net.netfilter.nf_conntrack_tcp_loose=0 2>/dev/null || true
     
@@ -122,18 +131,20 @@ case $NODE in
     server)         reset_server ;;
     secure_server)  secure_server ;;
     backbone)       reset_backbone ;;
+    secure_backbone) secure_backbone ;;
     openwrt)        reset_openwrt ;;
     secure_openwrt) secure_openwrt ;;
     attacker)       reset_attacker ;;
     *)
-        echo "Usage: bash reset_for_attack.sh [server|secure_server|backbone|openwrt|secure_openwrt|attacker]"
+        echo "Usage: bash reset_for_attack.sh [server|secure_server|backbone|secure_backbone|openwrt|secure_openwrt|attacker]"
         echo ""
         echo "Chạy trên từng node:"
         echo "  [Tạo lỗi] Server:  sudo bash reset_for_attack.sh server"
         echo "  [Bảo vệ]  Server:  sudo bash reset_for_attack.sh secure_server"
         echo "  [Tạo lỗi] OpenWrt: bash reset_for_attack.sh openwrt"
         echo "  [Bảo vệ]  OpenWrt: bash reset_for_attack.sh secure_openwrt"
-        echo "  [Cơ sở]   Backbone:bash reset_for_attack.sh backbone"
+        echo "  [Cơ sở]   Backbone:sudo bash reset_for_attack.sh backbone"
+        echo "  [Bảo vệ]  Backbone:sudo bash reset_for_attack.sh secure_backbone"
         echo "  [Tấn công]Attacker:sudo bash reset_for_attack.sh attacker"
         ;;
 esac
